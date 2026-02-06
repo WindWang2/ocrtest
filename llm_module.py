@@ -107,11 +107,22 @@ class SegmentDisplayDecimalFixer:
                 "range": [0, 14],        # pH范围
                 "decimals": 2,
             },
+            "ph_value": {
+                "rule": "from_right_2",
+                "range": [0, 14],        # pH范围（与ph字段相同）
+                "decimals": 2,
+            },
             "temperature": {
                 "rule": "from_right_1",
                 "range": [0, 100],
                 "decimals": 1,
                 "unit": "℃",
+            },
+            "mv_value": {
+                "rule": "none",          # mV值通常是整数（可为负数）
+                "range": [-2000, 2000],
+                "decimals": 0,
+                "unit": "mV",
             },
             "conductivity": {
                 "rule": "none",          # 电导率通常是整数
@@ -193,6 +204,31 @@ class SegmentDisplayDecimalFixer:
         },
     }
     
+    # 七段数码管常见数字混淆映射
+    # 七段显示中，由于某些段未被OCR识别（如亮度不够、角度问题），
+    # 容易产生以下混淆：
+    DIGIT_CONFUSIONS = {
+        '1': ['7'],       # 缺少顶部横段 → 7误识为1
+        '7': ['1'],       # 顶部横段噪声 → 1误识为7
+        '0': ['8'],       # 缺少中间横段
+        '8': ['0', '6'],  # 多余段
+        '6': ['8', '5'],  # 缺少/多余段
+        '5': ['6', '9'],  # 相似形状
+        '9': ['5', '3'],  # 相似形状
+        '3': ['9'],       # 相似形状
+    }
+
+    # 各仪器字段的"常见值"范围（用于判断digit confusion修正后哪个更合理）
+    # 这与DECIMAL_RULES中的range不同，range是"物理上可能的"范围，
+    # 而这里是"实验室日常最常见的"范围
+    COMMON_VALUE_RANGES = {
+        "ph_meter": {
+            "ph": [3.0, 11.0],        # 实验室最常见pH范围
+            "ph_value": [3.0, 11.0],
+            "temperature": [15.0, 40.0],
+        },
+    }
+
     # 仪器类型别名映射
     INSTRUMENT_ALIASES = {
         "scale": "electronic_scale",
@@ -437,7 +473,124 @@ class SegmentDisplayDecimalFixer:
         except:
             pass
         return value
-    
+
+    def fix_digit_confusion(
+        self,
+        value: float,
+        instrument_type: str,
+        field_name: str,
+    ) -> Tuple[float, bool, str]:
+        """
+        修正七段数码管的数字混淆
+
+        七段数码管中，由于某些段未被OCR正确识别，
+        可能导致数字被误读（如7被读成1，0被读成8等）。
+
+        本方法通过检查数值是否在"常见范围"外来判断是否存在数字混淆，
+        然后尝试用混淆映射替换各个数位，选择落入常见范围的结果。
+
+        Args:
+            value: 原始数值
+            instrument_type: 仪器类型
+            field_name: 字段名
+
+        Returns:
+            (修正后的值, 是否修正, 修正说明)
+        """
+        norm_type = self.normalize_instrument_type(instrument_type)
+        common_ranges = self.COMMON_VALUE_RANGES.get(norm_type, {})
+
+        # 查找该字段的常见范围
+        common_range = common_ranges.get(field_name)
+        if not common_range:
+            return value, False, "无常见范围定义"
+
+        # 如果值已经在常见范围内，不修正
+        if common_range[0] <= value <= common_range[1]:
+            return value, False, "值在常见范围内"
+
+        # 获取物理上可能的范围（用于验证替换结果）
+        rules = self.DECIMAL_RULES.get(norm_type, {})
+        rule_config = rules.get(field_name, rules.get("default", {}))
+        valid_range = rule_config.get("range", [0, float('inf')]) if rule_config else [0, float('inf')]
+
+        # 将数值转换为字符串，逐位尝试替换混淆数字
+        # 保留原始精度
+        if value == int(value):
+            value_str = str(int(value))
+        else:
+            value_str = f"{value:.2f}".rstrip('0').rstrip('.')
+            # 确保至少保留到已有精度
+            if '.' in str(value):
+                decimals = len(str(value).split('.')[1])
+                value_str = f"{value:.{decimals}f}"
+
+        best_value = value
+        best_distance = float('inf')
+        best_reason = ""
+
+        # 计算常见范围的中心值
+        range_center = (common_range[0] + common_range[1]) / 2
+
+        for i, char in enumerate(value_str):
+            if char == '.' or char == '-':
+                continue
+            if char not in self.DIGIT_CONFUSIONS:
+                continue
+            for alt_digit in self.DIGIT_CONFUSIONS[char]:
+                alt_str = value_str[:i] + alt_digit + value_str[i+1:]
+                try:
+                    alt_value = float(alt_str)
+                except ValueError:
+                    continue
+
+                # 检查替换后的值是否在常见范围内且物理上合理
+                if (common_range[0] <= alt_value <= common_range[1] and
+                        valid_range[0] <= alt_value <= valid_range[1]):
+                    distance = abs(alt_value - range_center)
+                    if distance < best_distance:
+                        best_value = alt_value
+                        best_distance = distance
+                        best_reason = (
+                            f"七段数码管数字混淆修正: {value} -> {alt_value} "
+                            f"('{char}'->'{alt_digit}' 在位置{i})"
+                        )
+
+        if best_value != value:
+            return best_value, True, best_reason
+
+        return value, False, "无法通过数字混淆修正"
+
+    def fix_all_readings_with_confusion(
+        self,
+        readings: Dict,
+        instrument_type: str,
+    ) -> Dict:
+        """
+        在小数点修正之后，额外进行数字混淆修正
+
+        Args:
+            readings: 读数字典（已完成小数点修正）
+            instrument_type: 仪器类型
+
+        Returns:
+            修正后的读数字典
+        """
+        corrected = {}
+        for key, value in readings.items():
+            if isinstance(value, (int, float)):
+                corrected_val, was_corrected, reason = self.fix_digit_confusion(
+                    float(value), instrument_type, key
+                )
+                if was_corrected:
+                    logger.info(f"数字混淆修正 [{key}]: {value} -> {corrected_val} ({reason})")
+                    corrected[key] = corrected_val
+                else:
+                    corrected[key] = value
+            else:
+                corrected[key] = value
+        return corrected
+
     def detect_instrument_from_ocr(self, ocr_results: List[Dict]) -> str:
         """
         从OCR结果中检测仪器类型
@@ -674,9 +827,13 @@ class LLMBase(ABC):
             
             # 应用小数点修正
             corrected_readings = self.decimal_fixer.fix_all_readings(readings, instrument_type)
+            # 应用七段数码管数字混淆修正（如 1↔7 混淆）
+            corrected_readings = self.decimal_fixer.fix_all_readings_with_confusion(
+                corrected_readings, instrument_type
+            )
             result["readings"] = corrected_readings
             readings = corrected_readings
-        
+
         # 验证解析结果
         confidence = self._calculate_confidence(readings, schema, ocr_results)
         
@@ -1032,17 +1189,33 @@ class RuleBasedParser(LLMBase):
             instrument_type = self.decimal_fixer.detect_instrument_from_ocr(ocr_results)
         
         schema = INSTRUMENT_SCHEMAS.get(instrument_type)
-        
+
         # 提取键值对
         all_text = [r["text"] for r in ocr_results]
         raw_readings = self._extract_readings_by_rules(ocr_results, schema)
-        
+
+        # ★★★ pH计特殊处理：使用空间分析提取数值 ★★★
+        if instrument_type == "ph_meter":
+            ph_readings = self._extract_ph_meter_readings(ocr_results)
+            # 将pH专用提取结果合并到raw_readings（pH专用结果优先）
+            for key, value in ph_readings.items():
+                if key not in raw_readings or raw_readings[key] is None:
+                    raw_readings[key] = value
+                elif key == "ph_value" and value is not None:
+                    # pH值始终用空间分析的结果覆盖
+                    raw_readings[key] = value
+
         # 映射到标准字段
-        mapped_readings = self._map_to_schema(raw_readings, schema)
-        
-        # ★★★ 关键修改：应用小数点修正 ★★★
+        mapped_readings = self._map_to_schema(raw_readings, schema, instrument_type)
+
+        # ★★★ 应用小数点修正 ★★★
         corrected_readings = self.decimal_fixer.fix_all_readings(mapped_readings, instrument_type)
-        
+
+        # ★★★ 应用七段数码管数字混淆修正（如 1↔7 混淆）★★★
+        corrected_readings = self.decimal_fixer.fix_all_readings_with_confusion(
+            corrected_readings, instrument_type
+        )
+
         # 计算置信度
         confidence = self._calculate_confidence(corrected_readings, schema, ocr_results)
         
@@ -1157,30 +1330,129 @@ class RuleBasedParser(LLMBase):
         
         return readings
     
+    def _extract_ph_meter_readings(self, ocr_results: List[Dict]) -> Dict:
+        """
+        pH计专用数值提取方法
+
+        pH计显示屏通常布局为：
+        - 大字体显示pH值（屏幕上半部分，字体最大）
+        - 小字体显示温度（屏幕下半部分左侧）
+        - 小字体显示mV值或电导率（屏幕下半部分右侧）
+
+        本方法使用OCR结果的位置信息（bounding box）来判断各数值的含义。
+        """
+        readings = {}
+
+        # 收集所有含数字的OCR结果及其位置
+        number_items = []
+        for r in ocr_results:
+            text = r.get("text", "").strip()
+            box = r.get("box", [[0, 0], [100, 0], [100, 30], [0, 30]])
+            match = re.search(r'(-?\d+\.?\d*)', text)
+            if not match:
+                continue
+            try:
+                num = float(match.group(1))
+            except ValueError:
+                continue
+
+            y_positions = [p[1] for p in box]
+            x_positions = [p[0] for p in box]
+            center_y = sum(y_positions) / len(y_positions)
+            center_x = sum(x_positions) / len(x_positions)
+            height = max(y_positions) - min(y_positions)
+
+            number_items.append({
+                "value": num,
+                "text": text,
+                "center_y": center_y,
+                "center_x": center_x,
+                "height": height,
+            })
+
+        if not number_items:
+            return readings
+
+        # 按字体高度排序（降序），最大的通常是pH主显示值
+        number_items.sort(key=lambda x: x["height"], reverse=True)
+
+        # 候选pH值：选择字体最大的数字
+        ph_assigned = False
+        for item in number_items:
+            val = item["value"]
+            # pH值在0-14范围（或缺少小数点：0-1400）
+            if 0 <= val <= 14:
+                readings["ph_value"] = val
+                ph_assigned = True
+                break
+            elif 0 < val <= 1400 and val == int(val):
+                # 可能缺少小数点，如 749 -> 7.49
+                corrected = val / 100.0
+                if 0 <= corrected <= 14:
+                    readings["ph_value"] = val  # 先存原始值，后续小数点修正器处理
+                    ph_assigned = True
+                    break
+
+        # 如果最大字体不在pH范围内，仍然把它作为pH候选
+        if not ph_assigned and number_items:
+            readings["ph_value"] = number_items[0]["value"]
+            ph_assigned = True
+
+        # 剩余数字按位置分配：温度和mV值
+        remaining = [item for item in number_items
+                     if item["value"] != readings.get("ph_value")]
+
+        for item in remaining:
+            val = item["value"]
+            text = item["text"]
+
+            # 判断是否是温度
+            # 温度：15-45 正常范围，或 150-450 缺少小数点
+            has_temp_unit = bool(re.search(r'[°℃]', text))
+            if has_temp_unit or (15 <= val <= 45):
+                readings.setdefault("temperature", val)
+                continue
+            if 150 <= val <= 450 and val == int(val):
+                readings.setdefault("temperature", val)  # 小数点修正器处理
+                continue
+
+            # 判断是否是mV值
+            has_mv_unit = bool(re.search(r'mV|mv', text, re.I))
+            if has_mv_unit or (abs(val) > 50 and "temperature" in readings):
+                readings.setdefault("mv_value", val)
+                continue
+
+            # 其他数值：可能是电导率
+            if val > 100:
+                readings.setdefault("mv_value", val)
+
+        return readings
+
     def _map_to_schema(
         self,
         raw_readings: Dict,
         schema: Optional[InstrumentSchema],
+        instrument_type: str = "unknown",
     ) -> Dict:
         """映射到标准字段"""
         if not schema:
             return raw_readings
-        
+
         mapped = {}
         for field_name, field_info in schema.fields.items():
             chinese_name = field_info.get("chinese", "")
-            
+
             # 直接匹配字段名
             if field_name in raw_readings:
                 mapped[field_name] = raw_readings[field_name]
                 continue
-            
+
             # 匹配中文名
             for key, value in raw_readings.items():
                 if chinese_name and (chinese_name in key or key in chinese_name):
                     mapped[field_name] = value
                     break
-            
+
             # 特殊匹配规则
             if field_name not in mapped:
                 if field_name == "weight" and "重量" not in str(raw_readings):
@@ -1192,7 +1464,22 @@ class RuleBasedParser(LLMBase):
                     # 使用main_display作为重量
                     if field_name not in mapped and "main_display" in raw_readings:
                         mapped[field_name] = raw_readings["main_display"]
-        
+
+        # pH计特殊处理：如果标准字段仍未填充，尝试从all_numbers智能分配
+        if instrument_type == "ph_meter":
+            all_numbers = raw_readings.get("all_numbers", [])
+            if all_numbers and "ph_value" not in mapped:
+                # 按数值大小和合理范围分配
+                for num in all_numbers:
+                    if 0 <= num <= 14 and "ph_value" not in mapped:
+                        mapped["ph_value"] = num
+                    elif 0 < num <= 1400 and num == int(num) and "ph_value" not in mapped:
+                        mapped["ph_value"] = num  # 留给小数点修正
+                    elif (15 <= num <= 45 or 150 <= num <= 450) and "temperature" not in mapped:
+                        mapped["temperature"] = num
+                    elif abs(num) > 50 and "mv_value" not in mapped:
+                        mapped["mv_value"] = num
+
         return mapped
     
     def _is_label(self, text: str) -> bool:
