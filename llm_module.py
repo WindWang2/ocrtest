@@ -959,8 +959,8 @@ class LLMBase(ABC):
         
         # 水质检测仪
         if any(kw in all_text for kw in ["检测结果", "吸光度", "透光度", "空白值", "检测值"]):
-            logger.info("仪器识别: water_quality_meter (关键词)")
-            return "water_quality_meter"
+            logger.info("仪器识别: water_quality_tester (关键词)")
+            return "water_quality_tester"
         
         # ========== 第三优先级：数值特征推断 ==========
         numbers = []
@@ -1194,6 +1194,13 @@ class RuleBasedParser(LLMBase):
         all_text = [r["text"] for r in ocr_results]
         raw_readings = self._extract_readings_by_rules(ocr_results, schema)
 
+        # ★★★ 水质检测仪特殊处理：使用空间分析配对标签和数值 ★★★
+        if instrument_type == "water_quality_tester":
+            wq_readings = self._extract_water_quality_readings(ocr_results)
+            for key, value in wq_readings.items():
+                if key not in raw_readings or raw_readings[key] is None:
+                    raw_readings[key] = value
+
         # ★★★ pH计特殊处理：使用空间分析提取数值 ★★★
         if instrument_type == "ph_meter":
             ph_readings = self._extract_ph_meter_readings(ocr_results)
@@ -1258,11 +1265,58 @@ class RuleBasedParser(LLMBase):
     ) -> Dict:
         """基于规则提取读数"""
         readings = {}
+
+        # ====== 第1步：从标签中提取嵌入的键值对 ======
+        # 这一步最高优先级，因为"标签+数值"的一体文本最可靠
+        # 记录哪些OCR条目已包含嵌入值（不再参与相邻配对）
+        embedded_value_indices = set()
+
+        for idx, r in enumerate(ocr_results):
+            text = r["text"]
+            # 检查分隔符格式：如 "速度: 100"
+            for sep in [":", "：", "="]:
+                if sep in text:
+                    parts = text.split(sep, 1)
+                    if len(parts) == 2:
+                        key = parts[0].strip()
+                        value = self._parse_value(parts[1].strip())
+                        if key and value is not None:
+                            readings[key] = value
+                            embedded_value_indices.add(idx)
+                    break
+            else:
+                # 无分隔符：检查是否为"中文标签+数值"的混合文本
+                # 如 "表/界面张力0.000", "温度12.6"
+                match_label_value = re.match(
+                    r'^([\u4e00-\u9fff/]+)\s*(-?\d+\.?\d*)\s*$', text
+                )
+                if match_label_value:
+                    key = match_label_value.group(1).strip()
+                    try:
+                        value = float(match_label_value.group(2))
+                        if key:
+                            readings[key] = value
+                            embedded_value_indices.add(idx)
+                    except ValueError:
+                        pass
+
+        # ====== 第2步：相邻元素配对 ======
+        for i, r in enumerate(ocr_results[:-1]):
+            # 跳过已包含嵌入值的条目
+            if i in embedded_value_indices:
+                continue
+            text = r["text"].rstrip(":：=")
+            next_text = ocr_results[i + 1]["text"]
+
+            # 如果当前是标签，下一个是数值
+            if self._is_label(text) and self._contains_number(next_text):
+                value = self._parse_value(next_text)
+                if value is not None and text not in readings:
+                    readings[text] = value
+
+        # ====== 第3步：单位模式匹配（低优先级，不覆盖已有值）======
         all_text = " ".join(r["text"] for r in ocr_results)
-        
-        # 特殊模式匹配
         patterns = {
-            # 数值+单位模式
             "weight_g": (r'(\d+\.?\d*)\s*g\b', "weight", "g"),
             "weight_kg": (r'(\d+\.?\d*)\s*kg\b', "weight", "kg"),
             "temp_c": (r'(\d+\.?\d*)\s*[°℃]C?', "temperature", "℃"),
@@ -1272,8 +1326,11 @@ class RuleBasedParser(LLMBase):
             "rpm": (r'(\d+)\s*(?:转|rpm|RPM)', "current_rpm", "转"),
             "density": (r'(\d+\.?\d*)\s*g/cm', "density", "g/cm³"),
         }
-        
+
         for key, (pattern, field_name, unit) in patterns.items():
+            # 不覆盖已通过标签提取得到的值
+            if field_name in readings:
+                continue
             match = re.search(pattern, all_text, re.IGNORECASE)
             if match:
                 try:
@@ -1282,31 +1339,6 @@ class RuleBasedParser(LLMBase):
                     readings[f"{field_name}_unit"] = unit
                 except ValueError:
                     pass
-        
-        # 键值对提取
-        for r in ocr_results:
-            text = r["text"]
-            # 检查分隔符
-            for sep in [":", "：", "="]:
-                if sep in text:
-                    parts = text.split(sep, 1)
-                    if len(parts) == 2:
-                        key = parts[0].strip()
-                        value = self._parse_value(parts[1].strip())
-                        if key and value is not None:
-                            readings[key] = value
-                    break
-        
-        # 相邻元素配对
-        for i, r in enumerate(ocr_results[:-1]):
-            text = r["text"].rstrip(":：=")
-            next_text = ocr_results[i + 1]["text"]
-            
-            # 如果当前是标签（中文或英文词），下一个是数值
-            if self._is_label(text) and self._contains_number(next_text):
-                value = self._parse_value(next_text)
-                if value is not None:
-                    readings[text] = value
         
         # ★★★ 提取所有独立的数字（可能是读数）★★★
         extracted_numbers = []
@@ -1344,8 +1376,26 @@ class RuleBasedParser(LLMBase):
         readings = {}
 
         # 收集所有含数字的OCR结果及其位置
-        number_items = []
+        # 特殊处理：OCR可能把相邻数值合并为一个文本（如 "25.0965"）
+        expanded_results = []
         for r in ocr_results:
+            text = r.get("text", "").strip()
+            # 检测是否是合并值：如 "25.0965" 应拆为 "25.0" 和 "965"
+            # 判断标准：小数后有超过2位，且整体值不合理
+            match_merged = re.match(r'^(\d+\.\d)(\d{3,})$', text)
+            if match_merged:
+                part1 = match_merged.group(1)  # e.g., "25.0"
+                part2 = match_merged.group(2)  # e.g., "965"
+                box = r.get("box", [[0, 0], [100, 0], [100, 30], [0, 30]])
+                # 拆为两个虚拟结果
+                expanded_results.append({**r, "text": part1, "box": box})
+                expanded_results.append({**r, "text": part2, "box": box})
+                logger.info(f"pH计合并值拆分: '{text}' -> '{part1}' + '{part2}'")
+            else:
+                expanded_results.append(r)
+
+        number_items = []
+        for r in expanded_results:
             text = r.get("text", "").strip()
             box = r.get("box", [[0, 0], [100, 0], [100, 30], [0, 30]])
             match = re.search(r'(-?\d+\.?\d*)', text)
@@ -1428,6 +1478,56 @@ class RuleBasedParser(LLMBase):
 
         return readings
 
+    def _extract_water_quality_readings(self, ocr_results: List[Dict]) -> Dict:
+        """
+        水质检测仪专用提取方法
+
+        水质检测仪显示屏通常是表格布局（可能旋转了90°），
+        标签在一列，数值在另一列。OCR旋转后，标签和对应值有相似的X坐标。
+
+        通过X坐标配对标签和数值。
+        """
+        readings = {}
+
+        # 已知的标签名
+        known_labels = {"检测结果", "检测项目", "检测日期", "空白值", "检测值",
+                        "吸光度", "含量", "透光度", "继续检测", "返回", "上传"}
+
+        # 分离标签和数值
+        labels = []
+        values = []
+        for r in ocr_results:
+            text = r.get("text", "").strip()
+            box = r.get("box", [[0, 0], [100, 0], [100, 30], [0, 30]])
+            center_x = sum(p[0] for p in box) / len(box)
+            center_y = sum(p[1] for p in box) / len(box)
+
+            is_label = text in known_labels or (
+                re.search(r'[\u4e00-\u9fff]', text) and not re.search(r'\d', text)
+                and text not in ("程）", "返回", "上传", "继续检测")
+            )
+
+            if is_label and text in known_labels:
+                labels.append({"text": text, "x": center_x, "y": center_y})
+            elif re.search(r'\d', text) or "mg" in text.lower():
+                values.append({"text": text, "x": center_x, "y": center_y})
+
+        # 按X坐标配对标签和数值（距离最近）
+        for label in labels:
+            best_val = None
+            best_dist = float('inf')
+            for val in values:
+                dist = abs(label["x"] - val["x"])
+                if dist < best_dist and dist < 50:  # 50像素阈值
+                    best_dist = dist
+                    best_val = val
+
+            if best_val:
+                readings[label["text"]] = best_val["text"]
+                values.remove(best_val)  # 避免重复配对
+
+        return readings
+
     def _map_to_schema(
         self,
         raw_readings: Dict,
@@ -1442,16 +1542,38 @@ class RuleBasedParser(LLMBase):
         for field_name, field_info in schema.fields.items():
             chinese_name = field_info.get("chinese", "")
 
-            # 直接匹配字段名
+            # 先尝试中文名匹配（更可靠，因为来自标签提取）
+            chinese_matched = False
+            for key, value in raw_readings.items():
+                if not chinese_name:
+                    continue
+                # 完全匹配或包含关系
+                if chinese_name in key or key in chinese_name:
+                    mapped[field_name] = value
+                    chinese_matched = True
+                    break
+                # 去掉分隔符后再匹配（如"表面/界面张力"匹配"表/界面张力"）
+                cn_clean = re.sub(r'[/、·]', '', chinese_name)
+                key_clean = re.sub(r'[/、·]', '', key)
+                if cn_clean and key_clean and (cn_clean in key_clean or key_clean in cn_clean):
+                    mapped[field_name] = value
+                    chinese_matched = True
+                    break
+                # 关键词匹配：中文名的核心部分（最后2-3个字）
+                if len(chinese_name) >= 2:
+                    core = chinese_name[-2:]
+                    if core in key:
+                        mapped[field_name] = value
+                        chinese_matched = True
+                        break
+
+            if chinese_matched:
+                continue
+
+            # 然后才使用直接字段名匹配（来自pattern match，优先级较低）
             if field_name in raw_readings:
                 mapped[field_name] = raw_readings[field_name]
                 continue
-
-            # 匹配中文名
-            for key, value in raw_readings.items():
-                if chinese_name and (chinese_name in key or key in chinese_name):
-                    mapped[field_name] = value
-                    break
 
             # 特殊匹配规则
             if field_name not in mapped:
@@ -1465,20 +1587,143 @@ class RuleBasedParser(LLMBase):
                     if field_name not in mapped and "main_display" in raw_readings:
                         mapped[field_name] = raw_readings["main_display"]
 
-        # pH计特殊处理：如果标准字段仍未填充，尝试从all_numbers智能分配
+        # ====== 仪器特殊处理：从all_numbers智能分配 ======
+        all_numbers = raw_readings.get("all_numbers", [])
+
         if instrument_type == "ph_meter":
-            all_numbers = raw_readings.get("all_numbers", [])
             if all_numbers and "ph_value" not in mapped:
-                # 按数值大小和合理范围分配
                 for num in all_numbers:
                     if 0 <= num <= 14 and "ph_value" not in mapped:
                         mapped["ph_value"] = num
                     elif 0 < num <= 1400 and num == int(num) and "ph_value" not in mapped:
-                        mapped["ph_value"] = num  # 留给小数点修正
+                        mapped["ph_value"] = num
                     elif (15 <= num <= 45 or 150 <= num <= 450) and "temperature" not in mapped:
                         mapped["temperature"] = num
                     elif abs(num) > 50 and "mv_value" not in mapped:
                         mapped["mv_value"] = num
+
+        elif instrument_type == "water_quality_tester":
+            # 水质检测仪：从中文标签名映射到英文字段名
+            chinese_to_field = {
+                "检测项目": "test_item",
+                "检测结果": "test_item",  # 有时用"检测结果"代替
+                "检测日期": "test_date",
+                "空白值": "blank_value",
+                "检测值": "test_value",
+                "吸光度": "absorbance",
+                "含量": "content",
+                "透光度": "transmittance",
+            }
+            for raw_key, raw_value in raw_readings.items():
+                field = chinese_to_field.get(raw_key)
+                if field and field not in mapped:
+                    mapped[field] = raw_value
+
+            # 查找日期 (格式 "2026-01-12") 和时间 (格式 "16:12:41")
+            if "test_date" not in mapped:
+                for raw_key, raw_value in raw_readings.items():
+                    val_str = str(raw_value) if raw_value is not None else str(raw_key)
+                    if re.match(r'\d{4}-\d{2}-\d{2}', val_str):
+                        mapped["test_date"] = val_str
+                        break
+
+            # 透光度可能误匹配为humidity（100.00%），修正
+            if "humidity" in mapped and "transmittance" not in mapped:
+                mapped["transmittance"] = f"{mapped.pop('humidity')}%"
+            if "humidity_unit" in mapped:
+                del mapped["humidity_unit"]
+
+            # 提取测试项目名（如 "总硬度（低量程）"）
+            if "test_item" not in mapped:
+                for raw_key in raw_readings:
+                    if "硬度" in str(raw_key) or "氨氮" in str(raw_key) or "COD" in str(raw_key):
+                        mapped["test_item"] = str(raw_key)
+                        break
+
+        elif instrument_type == "water_bath":
+            # 恒温水浴锅：通常只有一个数值（温度）
+            if "temperature" not in mapped:
+                # 优先使用main_display
+                if "main_display" in raw_readings:
+                    mapped["temperature"] = raw_readings["main_display"]
+                elif all_numbers:
+                    # 选择最合理的温度值
+                    for num in all_numbers:
+                        if 20 <= num <= 100:
+                            mapped["temperature"] = num
+                            break
+                        elif 200 <= num <= 1000 and num == int(num):
+                            # 缺少小数点，如905 -> 90.5
+                            mapped["temperature"] = num
+                            break
+
+        elif instrument_type == "surface_tensiometer":
+            # 表面张力仪：验证和修正数值范围
+            if "rise_speed" in mapped and isinstance(mapped["rise_speed"], (int, float)):
+                if mapped["rise_speed"] > 1000:
+                    # 速度不应超过1000mm/min，可能是OCR错误
+                    # 尝试取前面合理部分
+                    s = str(int(mapped["rise_speed"]))
+                    for length in [1, 2, 3]:
+                        try:
+                            v = float(s[:length])
+                            if v <= 200:
+                                mapped["rise_speed"] = v
+                                break
+                        except ValueError:
+                            pass
+            if "fall_speed" in mapped and isinstance(mapped["fall_speed"], (int, float)):
+                if mapped["fall_speed"] > 1000:
+                    s = str(int(mapped["fall_speed"]))
+                    for length in [1, 2, 3]:
+                        try:
+                            v = float(s[:length])
+                            if v <= 200:
+                                mapped["fall_speed"] = v
+                                break
+                        except ValueError:
+                            pass
+            # surface_tension不应大于100 mN/m通常
+            if "surface_tension" in mapped and isinstance(mapped["surface_tension"], (int, float)):
+                if mapped["surface_tension"] > 100:
+                    # 可能是误读，不是张力值
+                    del mapped["surface_tension"]
+
+        elif instrument_type == "electronic_scale":
+            # 电子秤：主显示为重量
+            if "weight" not in mapped:
+                if "main_display" in raw_readings:
+                    mapped["weight"] = raw_readings["main_display"]
+                elif all_numbers:
+                    # 选最大的数作为重量
+                    mapped["weight"] = max(all_numbers)
+
+        elif instrument_type == "viscometer":
+            # 粘度计：速度和粘度值
+            if all_numbers:
+                for num in all_numbers:
+                    if "viscosity" not in mapped:
+                        mapped["viscosity"] = num
+                    elif "speed" not in mapped:
+                        mapped["speed"] = num
+
+        elif instrument_type == "mixer_stirrer":
+            # 混调器/搅拌器：解析高速/低速模式的转速和时间
+            # 从raw_readings的中文标签中提取
+            # raw_readings可能包含: "转速（转）"->3000, "时间（S）"->120 等
+            # 以及 "当前转速（转）"->某个值
+            for raw_key, raw_value in raw_readings.items():
+                if not isinstance(raw_value, (int, float)):
+                    continue
+                if "当前" in str(raw_key) and "转速" in str(raw_key):
+                    mapped.setdefault("current_rpm", raw_value)
+                elif "转速" in str(raw_key) and "current_rpm" not in mapped:
+                    mapped.setdefault("speed", raw_value)
+            # 从all_numbers推断（高速通常>1000，低速通常<1000）
+            if all_numbers and "speed" not in mapped and "current_rpm" not in mapped:
+                speeds = [n for n in all_numbers if n >= 100]
+                if speeds:
+                    mapped["speed"] = max(speeds)
 
         return mapped
     

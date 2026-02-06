@@ -56,6 +56,84 @@ class InstrumentReader:
         self.verbose = verbose
         self.retry_config = OCR_RETRY_CONFIG
     
+    def _score_ocr_results(self, ocr_results) -> float:
+        """评估OCR结果质量，用于选择最佳旋转角度"""
+        if not ocr_results:
+            return 0.0
+        # 综合评分：文本数量 * 平均置信度 * 包含数字的比例
+        avg_conf = sum(r.confidence for r in ocr_results) / len(ocr_results)
+        import re
+        has_number = sum(1 for r in ocr_results if re.search(r'\d', r.text))
+        has_chinese = sum(1 for r in ocr_results if re.search(r'[\u4e00-\u9fff]', r.text))
+        # 包含数字和中文字符的结果更可能是正确方向
+        return len(ocr_results) * avg_conf * (1 + has_number * 0.5 + has_chinese * 0.3)
+
+    def _find_best_rotation(self, image_path: str) -> tuple:
+        """
+        自动检测最佳旋转角度和预处理方式
+
+        策略：先尝试不同旋转（无增强），如果结果足够好就使用。
+        如果所有旋转结果都不好（<阈值），再尝试增强+旋转。
+
+        Returns:
+            (best_ocr_results, best_rotation, best_preprocess_config)
+        """
+        # 第一轮：不同旋转，无增强
+        basic_configs = [
+            {"rotation": 0},
+            {"rotation": 90},
+            {"rotation": 270},
+        ]
+        best_results = []
+        best_score = 0.0
+        best_rotation = 0
+        best_config = {}
+
+        for config in basic_configs:
+            try:
+                ocr_results = self.ocr_engine.recognize_file(
+                    image_path, preprocess_config=config,
+                )
+            except Exception:
+                continue
+
+            score = self._score_ocr_results(ocr_results)
+            if score > best_score:
+                best_score = score
+                best_results = ocr_results
+                best_rotation = config.get("rotation", 0)
+                best_config = config
+
+        # 如果基本结果足够好（有多条结果且含数字），直接返回
+        import re as _re
+        has_numbers = any(_re.search(r'\d', r.text) for r in best_results)
+        if best_score >= 3.0 and has_numbers and len(best_results) >= 2:
+            return best_results, best_rotation, best_config
+
+        # 第二轮：增强预处理+旋转（仅当基本结果不够好时）
+        enhanced_configs = [
+            {"rotation": 0, "enhance_contrast": True, "contrast_factor": 2.0, "denoise": True},
+            {"rotation": 90, "enhance_contrast": True, "contrast_factor": 2.0, "denoise": True},
+            {"rotation": 270, "enhance_contrast": True, "contrast_factor": 2.0, "denoise": True},
+        ]
+
+        for config in enhanced_configs:
+            try:
+                ocr_results = self.ocr_engine.recognize_file(
+                    image_path, preprocess_config=config,
+                )
+            except Exception:
+                continue
+
+            score = self._score_ocr_results(ocr_results)
+            if score > best_score:
+                best_score = score
+                best_results = ocr_results
+                best_rotation = config.get("rotation", 0)
+                best_config = config
+
+        return best_results, best_rotation, best_config
+
     def process_image(
         self,
         image_path: str,
@@ -63,40 +141,106 @@ class InstrumentReader:
     ) -> Dict:
         """
         处理单张图片
-        
+
         Args:
             image_path: 图片路径
             instrument_type: 指定仪器类型（可选）
-        
+
         Returns:
             处理结果字典
         """
         if self.verbose:
             print(f"\n{'='*60}")
-            print(f"📷 处理图片: {os.path.basename(image_path)}")
+            print(f"  处理图片: {os.path.basename(image_path)}")
             print(f"{'='*60}")
-        
+
         if not os.path.exists(image_path):
             return self._error_result(image_path, f"文件不存在: {image_path}")
-        
-        max_attempts = self.retry_config.get("max_retries", 3)
+
+        max_attempts = self.retry_config.get("max_retries", 6)
         retry_presets = self.retry_config.get("retry_presets", [{}])
-        
+        auto_rotate = self.retry_config.get("auto_rotate", True)
+
         last_ocr_results = []
         last_error = ""
-        
+
+        # ====== 第一步：自动旋转检测 ======
+        if auto_rotate:
+            if self.verbose:
+                print(f"\n  自动旋转检测中...")
+
+            ocr_results, best_rotation, best_config = self._find_best_rotation(image_path)
+            ocr_dicts = [r.to_dict() for r in ocr_results]
+            last_ocr_results = ocr_dicts
+
+            if self.verbose:
+                rotation_text = f"旋转{best_rotation}°" if best_rotation else "原始方向"
+                print(f"   最佳方向: {rotation_text} ({len(ocr_results)}条OCR结果)")
+                print(f"\n   OCR识别结果 ({len(ocr_results)}条):")
+                print(format_ocr_results_for_display(ocr_results))
+
+                stats = get_ocr_statistics(ocr_results)
+                if stats["count"] > 0:
+                    print(f"\n   置信度: 平均={stats['avg']:.2f}, "
+                          f"最低={stats['min']:.2f}, 最高={stats['max']:.2f}")
+
+            # 尝试解析
+            if ocr_dicts:
+                if self.verbose:
+                    print(f"\n   LLM解析中...")
+
+                try:
+                    parse_result = self.llm.parse_instrument_reading(
+                        ocr_dicts,
+                        instrument_type=instrument_type,
+                        attempt=1,
+                        max_attempts=max_attempts,
+                    )
+
+                    if parse_result.status == ValidationResult.SUCCESS:
+                        inst_type = parse_result.data.get("instrument_type", "unknown")
+                        readings = parse_result.data.get("readings", {})
+                        # 检查readings是否有实质内容（排除只有all_numbers的情况）
+                        has_real_readings = any(
+                            k not in ("all_numbers", "main_display") and v not in (None, "", "N/A")
+                            for k, v in readings.items()
+                            if not k.endswith("_unit")
+                        )
+
+                        if has_real_readings and inst_type != "unknown":
+                            if self.verbose:
+                                inst_name = INSTRUMENT_CONFIG.get(inst_type, {}).get("name", inst_type)
+                                print(f"\n   识别成功!")
+                                print(f"   仪器类型: {inst_name} ({inst_type})")
+                                print(f"   置信度: {parse_result.confidence:.2%}")
+
+                            return {
+                                "success": True,
+                                "image_path": image_path,
+                                "instrument_type": inst_type,
+                                "readings": readings,
+                                "confidence": parse_result.confidence,
+                                "raw_ocr": parse_result.raw_ocr_texts,
+                                "attempts": 1,
+                                "rotation": best_rotation,
+                            }
+                except Exception as e:
+                    logger.error(f"LLM解析失败: {e}")
+                    last_error = str(e)
+
+        # ====== 第二步：按预设重试 ======
         for attempt in range(1, max_attempts + 1):
             if self.verbose:
-                print(f"\n🔄 尝试 {attempt}/{max_attempts}")
-            
+                print(f"\n  重试 {attempt}/{max_attempts}")
+
             # 选择预处理配置
             preset_idx = min(attempt - 1, len(retry_presets) - 1)
             preprocess_config = retry_presets[preset_idx] if retry_presets else {}
             preset_name = preprocess_config.get("name", "default")
-            
+
             if self.verbose:
                 print(f"   预处理策略: {preset_name}")
-            
+
             # OCR识别
             try:
                 ocr_results = self.ocr_engine.recognize_file(
@@ -107,25 +251,25 @@ class InstrumentReader:
                 logger.error(f"OCR识别失败: {e}")
                 last_error = str(e)
                 continue
-            
+
             # 转换格式
             ocr_dicts = [r.to_dict() for r in ocr_results]
             last_ocr_results = ocr_dicts
-            
+
             # 输出OCR结果
             if self.verbose:
-                print(f"\n   📝 OCR识别结果 ({len(ocr_results)}条):")
+                print(f"\n   OCR识别结果 ({len(ocr_results)}条):")
                 print(format_ocr_results_for_display(ocr_results))
-                
+
                 stats = get_ocr_statistics(ocr_results)
                 if stats["count"] > 0:
-                    print(f"\n   📊 置信度: 平均={stats['avg']:.2f}, "
+                    print(f"\n   置信度: 平均={stats['avg']:.2f}, "
                           f"最低={stats['min']:.2f}, 最高={stats['max']:.2f}")
-            
+
             # LLM解析
             if self.verbose:
-                print(f"\n   🤖 LLM解析中...")
-            
+                print(f"\n   LLM解析中...")
+
             try:
                 parse_result = self.llm.parse_instrument_reading(
                     ocr_dicts,
@@ -137,16 +281,16 @@ class InstrumentReader:
                 logger.error(f"LLM解析失败: {e}")
                 last_error = str(e)
                 continue
-            
+
             # 处理结果
             if parse_result.status == ValidationResult.SUCCESS:
                 if self.verbose:
                     inst_type = parse_result.data.get("instrument_type", "unknown")
                     inst_name = INSTRUMENT_CONFIG.get(inst_type, {}).get("name", inst_type)
-                    print(f"\n   ✅ 识别成功!")
+                    print(f"\n   识别成功!")
                     print(f"   仪器类型: {inst_name} ({inst_type})")
                     print(f"   置信度: {parse_result.confidence:.2%}")
-                
+
                 return {
                     "success": True,
                     "image_path": image_path,
@@ -156,19 +300,19 @@ class InstrumentReader:
                     "raw_ocr": parse_result.raw_ocr_texts,
                     "attempts": attempt,
                 }
-            
+
             elif parse_result.status == ValidationResult.NEED_RETRY:
                 if self.verbose:
-                    print(f"\n   ⚠️  需要重试: {parse_result.message}")
+                    print(f"\n   需要重试: {parse_result.message}")
                 last_error = parse_result.message
                 continue
-            
+
             else:  # FAILED
                 if self.verbose:
-                    print(f"\n   ❌ 解析失败: {parse_result.message}")
+                    print(f"\n   解析失败: {parse_result.message}")
                 last_error = parse_result.message
                 break
-        
+
         # 所有尝试失败
         return self._error_result(
             image_path, last_error,
