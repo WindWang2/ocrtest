@@ -210,8 +210,8 @@ class OCREngine(ABC):
 # PaddleOCR引擎
 # =============================================================================
 class PaddleOCREngine(OCREngine):
-    """PaddleOCR引擎实现（适配新版API）"""
-    
+    """PaddleOCR引擎实现（兼容v2和v3 API）"""
+
     def __init__(
         self,
         use_doc_orientation_classify: bool = False,
@@ -224,79 +224,153 @@ class PaddleOCREngine(OCREngine):
         self.use_textline_orientation = use_textline_orientation
         self.use_gpu = use_gpu
         self._ocr = None
-    
+        self._api_version = None  # 'v2' or 'v3'
+
     def _lazy_init(self):
-        """延迟初始化OCR引擎"""
-        if self._ocr is None:
+        """延迟初始化OCR引擎，自动检测并适配v2/v3 API"""
+        if self._ocr is not None:
+            return
+
+        try:
+            from paddleocr import PaddleOCR
+            import logging as _logging
+
+            # 抑制PaddleOCR的日志输出
+            _logging.getLogger("ppocr").setLevel(_logging.WARNING)
+
+            # 先尝试v3 API（新版PaddleOCR >= 3.0）
             try:
-                from paddleocr import PaddleOCR
-                import logging as _logging
-                
-                # 抑制PaddleOCR的日志输出
-                _logging.getLogger("ppocr").setLevel(_logging.WARNING)
-                
                 self._ocr = PaddleOCR(
                     use_doc_orientation_classify=self.use_doc_orientation_classify,
                     use_doc_unwarping=self.use_doc_unwarping,
                     use_textline_orientation=self.use_textline_orientation,
                 )
-                
-                logger.info("PaddleOCR引擎初始化成功")
-            except ImportError:
-                raise ImportError(
-                    "PaddleOCR未安装，请执行: pip install paddlepaddle paddleocr"
+                # 测试v3 API是否真正可用
+                if hasattr(self._ocr, 'predict'):
+                    self._api_version = 'v3'
+                    logger.info("PaddleOCR引擎初始化成功 (v3 API)")
+                else:
+                    self._api_version = 'v2'
+                    logger.info("PaddleOCR引擎初始化成功 (v2 API)")
+            except (TypeError, Exception) as e:
+                # v2 API不支持这些参数，使用v2初始化方式
+                logger.info(f"v3 API初始化失败({e})，回退到v2 API")
+                self._ocr = PaddleOCR(
+                    use_angle_cls=True,
+                    lang='ch',
+                    use_gpu=self.use_gpu,
+                    show_log=False,
                 )
-    
+                self._api_version = 'v2'
+                logger.info("PaddleOCR引擎初始化成功 (v2 API fallback)")
+
+        except ImportError:
+            raise ImportError(
+                "PaddleOCR未安装，请执行: pip install paddlepaddle paddleocr"
+            )
+
+    def _parse_v2_output(self, ocr_output) -> List[OCRResult]:
+        """解析PaddleOCR v2 API输出格式"""
+        results = []
+        if not ocr_output:
+            return results
+
+        for line in ocr_output:
+            if line is None:
+                continue
+            for item in line:
+                if item is None or len(item) < 2:
+                    continue
+                box = item[0]
+                text_info = item[1]
+                if isinstance(text_info, (list, tuple)) and len(text_info) >= 2:
+                    text = str(text_info[0]).strip()
+                    score = float(text_info[1])
+                elif isinstance(text_info, str):
+                    text = text_info.strip()
+                    score = 0.0
+                else:
+                    continue
+
+                if text:
+                    box_list = [[int(p[0]), int(p[1])] for p in box]
+                    results.append(OCRResult(
+                        text=text,
+                        confidence=score,
+                        box=box_list,
+                    ))
+        return results
+
+    def _parse_v3_output(self, ocr_output) -> List[OCRResult]:
+        """解析PaddleOCR v3 API输出格式"""
+        results = []
+        if not ocr_output:
+            return results
+
+        for res in ocr_output:
+            # 对象属性格式
+            if hasattr(res, 'rec_texts') and hasattr(res, 'rec_scores') and hasattr(res, 'dt_polys'):
+                texts = res.rec_texts
+                scores = res.rec_scores
+                boxes = res.dt_polys
+
+                for text, score, box in zip(texts, scores, boxes):
+                    if text and text.strip():
+                        box_list = [[int(p[0]), int(p[1])] for p in box]
+                        results.append(OCRResult(
+                            text=text.strip(),
+                            confidence=float(score),
+                            box=box_list,
+                        ))
+            # 字典格式
+            elif isinstance(res, dict) and 'rec_texts' in res:
+                texts = res.get('rec_texts', [])
+                scores = res.get('rec_scores', [])
+                boxes = res.get('dt_polys', [])
+
+                for i, text in enumerate(texts):
+                    if text and text.strip():
+                        score = scores[i] if i < len(scores) else 0.0
+                        box = boxes[i] if i < len(boxes) else [[0,0],[100,0],[100,30],[0,30]]
+                        box_list = [[int(p[0]), int(p[1])] for p in box]
+                        results.append(OCRResult(
+                            text=text.strip(),
+                            confidence=float(score),
+                            box=box_list,
+                        ))
+        return results
+
+    def _call_ocr(self, input_data):
+        """调用OCR，自动适配v2/v3 API，v3失败时自动回退到v2"""
+        # 先尝试当前API版本
+        if self._api_version == 'v3':
+            try:
+                ocr_output = self._ocr.predict(input=input_data)
+                return self._parse_v3_output(ocr_output)
+            except (NotImplementedError, Exception) as e:
+                logger.warning(f"PaddleOCR v3 API失败，尝试v2 API: {e}")
+                # 回退到v2 API
+                self._api_version = 'v2'
+
+        # v2 API
+        if isinstance(input_data, str):
+            ocr_output = self._ocr.ocr(input_data, cls=True)
+        else:
+            ocr_output = self._ocr.ocr(input_data, cls=True)
+        return self._parse_v2_output(ocr_output)
+
     def recognize(self, image: np.ndarray) -> List[OCRResult]:
         """识别图像"""
         self._lazy_init()
-        
-        results = []
+
         try:
-            # 新版API使用predict方法
-            ocr_output = self._ocr.predict(input=image)
-            
-            if ocr_output:
-                for res in ocr_output:
-                    # 从结果对象中提取识别数据
-                    if hasattr(res, 'rec_texts') and hasattr(res, 'rec_scores') and hasattr(res, 'dt_polys'):
-                        texts = res.rec_texts
-                        scores = res.rec_scores
-                        boxes = res.dt_polys
-                        
-                        for text, score, box in zip(texts, scores, boxes):
-                            if text and text.strip():
-                                # 转换box格式
-                                box_list = [[int(p[0]), int(p[1])] for p in box]
-                                results.append(OCRResult(
-                                    text=text.strip(),
-                                    confidence=float(score),
-                                    box=box_list,
-                                ))
-                    # 兼容字典格式的结果
-                    elif isinstance(res, dict):
-                        if 'rec_texts' in res:
-                            texts = res.get('rec_texts', [])
-                            scores = res.get('rec_scores', [])
-                            boxes = res.get('dt_polys', [])
-                            
-                            for i, text in enumerate(texts):
-                                if text and text.strip():
-                                    score = scores[i] if i < len(scores) else 0.0
-                                    box = boxes[i] if i < len(boxes) else [[0,0],[100,0],[100,30],[0,30]]
-                                    box_list = [[int(p[0]), int(p[1])] for p in box]
-                                    results.append(OCRResult(
-                                        text=text.strip(),
-                                        confidence=float(score),
-                                        box=box_list,
-                                    ))
+            return self._call_ocr(image)
         except Exception as e:
             logger.error(f"OCR识别出错: {e}")
             import traceback
             traceback.print_exc()
-        
-        return results
-    
+            return []
+
     def recognize_file(
         self,
         image_path: str,
@@ -304,55 +378,21 @@ class PaddleOCREngine(OCREngine):
     ) -> List[OCRResult]:
         """识别图像文件"""
         self._lazy_init()
-        
+
         # 如果需要预处理，则加载图像进行处理
         if preprocess_config and any(preprocess_config.values()):
             img = ImagePreprocessor.load_image(image_path)
             img = ImagePreprocessor.preprocess(img, **preprocess_config)
             return self.recognize(img)
-        
-        # 否则直接使用文件路径（新版API支持）
-        results = []
+
+        # 直接使用文件路径
         try:
-            ocr_output = self._ocr.predict(input=image_path)
-            
-            if ocr_output:
-                for res in ocr_output:
-                    if hasattr(res, 'rec_texts') and hasattr(res, 'rec_scores') and hasattr(res, 'dt_polys'):
-                        texts = res.rec_texts
-                        scores = res.rec_scores
-                        boxes = res.dt_polys
-                        
-                        for text, score, box in zip(texts, scores, boxes):
-                            if text and text.strip():
-                                box_list = [[int(p[0]), int(p[1])] for p in box]
-                                results.append(OCRResult(
-                                    text=text.strip(),
-                                    confidence=float(score),
-                                    box=box_list,
-                                ))
-                    elif isinstance(res, dict):
-                        if 'rec_texts' in res:
-                            texts = res.get('rec_texts', [])
-                            scores = res.get('rec_scores', [])
-                            boxes = res.get('dt_polys', [])
-                            
-                            for i, text in enumerate(texts):
-                                if text and text.strip():
-                                    score = scores[i] if i < len(scores) else 0.0
-                                    box = boxes[i] if i < len(boxes) else [[0,0],[100,0],[100,30],[0,30]]
-                                    box_list = [[int(p[0]), int(p[1])] for p in box]
-                                    results.append(OCRResult(
-                                        text=text.strip(),
-                                        confidence=float(score),
-                                        box=box_list,
-                                    ))
+            return self._call_ocr(image_path)
         except Exception as e:
             logger.error(f"OCR识别出错: {e}")
             import traceback
             traceback.print_exc()
-        
-        return results
+            return []
 
 
 # =============================================================================

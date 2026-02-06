@@ -7,11 +7,12 @@
 # OCR 重试配置
 # =============================================================================
 OCR_RETRY_CONFIG = {
-    "max_retries": 3,                    # 最大重试次数
+    "max_retries": 6,                    # 最大重试次数（含旋转尝试）
     "confidence_threshold": 0.10,        # 最低置信度阈值（降低以提高通过率）
     "min_text_count": 1,                 # 最少需要识别的文本数量
     "require_numbers": False,            # 是否强制要求有数字
-    
+    "auto_rotate": True,                 # 自动旋转检测（尝试0/90/270度）
+
     # 不同重试级别的预处理参数
     "retry_presets": [
         {
@@ -22,12 +23,34 @@ OCR_RETRY_CONFIG = {
             "rotation": 0,
         },
         {
+            "name": "rotate_90",
+            "enhance_contrast": False,
+            "denoise": False,
+            "binarize": False,
+            "rotation": 90,
+        },
+        {
+            "name": "rotate_270",
+            "enhance_contrast": False,
+            "denoise": False,
+            "binarize": False,
+            "rotation": 270,
+        },
+        {
             "name": "enhanced",
             "enhance_contrast": True,
             "contrast_factor": 1.8,
             "denoise": True,
             "binarize": False,
             "rotation": 0,
+        },
+        {
+            "name": "enhanced_rotate_90",
+            "enhance_contrast": True,
+            "contrast_factor": 1.8,
+            "denoise": True,
+            "binarize": False,
+            "rotation": 90,
         },
         {
             "name": "aggressive",
